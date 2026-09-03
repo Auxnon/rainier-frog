@@ -134,7 +134,14 @@ impl Vim {
           Input { key: Key::Char('l'), .. } | Input { key: Key::Right, .. } => {
             textarea.move_cursor(CursorMove::Forward)
           },
+          Input { key: Key::Char('w'), ctrl: false, .. }
+            if matches!(self.mode, Mode::Operator(_))
+              && matches!(self.pending, Input { key: Key::Char('i'), ctrl: false, .. }) =>
+          {
+            select_inner_word(textarea); // `iw` text object, e.g. `ciw`, `diw`, `yiw`
+          },
           Input { key: Key::Char('w'), .. } => textarea.move_cursor(CursorMove::WordForward),
+          Input { key: Key::Char('W'), ctrl: false, .. } => move_cursor_big_word_forward(textarea),
           Input { key: Key::Char('e'), ctrl: false, .. }
             if matches!(self.mode, Mode::Operator(_)) =>
           {
@@ -146,6 +153,7 @@ impl Vim {
           Input { key: Key::Char('b'), ctrl: false, .. } => {
             textarea.move_cursor(CursorMove::WordBack)
           },
+          Input { key: Key::Char('B'), ctrl: false, .. } => move_cursor_big_word_backward(textarea),
           Input { key: Key::Char('^'), .. } => textarea.move_cursor(CursorMove::Head),
           Input { key: Key::Char('0'), .. } => textarea.move_cursor(CursorMove::Head),
           Input { key: Key::Char('$'), .. } => textarea.move_cursor(CursorMove::End),
@@ -213,6 +221,12 @@ impl Vim {
             textarea.cut();
             self.send_copy_action_with_text(textarea.yank_text());
             return Transition::Mode(Mode::Normal);
+          },
+          Input { key: Key::Char('i'), ctrl: false, .. }
+            if matches!(self.mode, Mode::Operator(_)) =>
+          {
+            // Wait for the text object that follows, e.g. `w` in `ciw`/`diw`/`yiw`.
+            return Transition::Pending(input);
           },
           Input { key: Key::Char('i'), .. } => {
             textarea.cancel_selection();
@@ -410,4 +424,110 @@ impl Vim {
       sender.send(Action::CopyData(text)).map_or_else(|e| log::error!("{e:?}"), |_| {});
     }
   }
+}
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum InnerWordKind {
+  Space,
+  Punct,
+  Other,
+}
+
+impl InnerWordKind {
+  fn of(c: char) -> Self {
+    if c.is_whitespace() {
+      Self::Space
+    } else if c == '_' {
+      Self::Other
+    } else if c.is_ascii_punctuation() {
+      Self::Punct
+    } else {
+      Self::Other
+    }
+  }
+}
+
+// Select the `iw` text object under the cursor: the run of same-kind characters (word,
+// punctuation, or whitespace) touching the cursor, not crossing line boundaries.
+fn select_inner_word(textarea: &mut TextArea) {
+  let cursor = textarea.cursor();
+  let chars: Vec<char> = textarea.lines()[cursor.0].chars().collect();
+  if chars.is_empty() {
+    return;
+  }
+  let col = cursor.1.min(chars.len() - 1);
+  let kind = InnerWordKind::of(chars[col]);
+  let mut start = col;
+  while start > 0 && InnerWordKind::of(chars[start - 1]) == kind {
+    start -= 1;
+  }
+  let mut end = col;
+  while end + 1 < chars.len() && InnerWordKind::of(chars[end + 1]) == kind {
+    end += 1;
+  }
+  let row = cursor.0;
+  textarea.cancel_selection();
+  textarea.move_cursor(CursorMove::Jump(row as u16, start as u16));
+  textarea.start_selection();
+  textarea.move_cursor(CursorMove::Jump(row as u16, (end + 1) as u16));
+}
+
+// Unlike a (small) word, a WORD is only delimited by whitespace, e.g. `foo(a).bar` is one WORD.
+fn find_big_word_start_forward(line: &str, start_col: usize) -> Option<usize> {
+  let chars: Vec<char> = line.chars().collect();
+  let n = chars.len();
+  let mut i = start_col.min(n);
+  while i < n && !chars[i].is_whitespace() {
+    i += 1;
+  }
+  while i < n && chars[i].is_whitespace() {
+    i += 1;
+  }
+  (i < n).then_some(i)
+}
+
+fn find_big_word_start_backward(line: &str, start_col: usize) -> Option<usize> {
+  let chars: Vec<char> = line.chars().collect();
+  let p = start_col.min(chars.len());
+  if p == 0 {
+    return None;
+  }
+  let mut i = p - 1;
+  while i > 0 && chars[i].is_whitespace() {
+    i -= 1;
+  }
+  if chars[i].is_whitespace() {
+    return None;
+  }
+  while i > 0 && !chars[i - 1].is_whitespace() {
+    i -= 1;
+  }
+  Some(i)
+}
+
+fn move_cursor_big_word_forward(textarea: &mut TextArea) {
+  let cursor = textarea.cursor();
+  let lines = textarea.lines();
+  let target = if let Some(col) = find_big_word_start_forward(&lines[cursor.0], cursor.1) {
+    (cursor.0, col)
+  } else if cursor.0 + 1 < lines.len() {
+    (cursor.0 + 1, 0)
+  } else {
+    (cursor.0, lines[cursor.0].chars().count())
+  };
+  textarea.move_cursor(CursorMove::Jump(target.0 as u16, target.1 as u16));
+}
+
+fn move_cursor_big_word_backward(textarea: &mut TextArea) {
+  let cursor = textarea.cursor();
+  let lines = textarea.lines();
+  let target = if let Some(col) = find_big_word_start_backward(&lines[cursor.0], cursor.1) {
+    (cursor.0, col)
+  } else if cursor.0 > 0 {
+    let row = cursor.0 - 1;
+    (row, lines[row].chars().count())
+  } else {
+    (cursor.0, 0)
+  };
+  textarea.move_cursor(CursorMove::Jump(target.0 as u16, target.1 as u16));
 }
