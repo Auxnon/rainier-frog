@@ -135,10 +135,22 @@ impl Vim {
             textarea.move_cursor(CursorMove::Forward)
           },
           Input { key: Key::Char('w'), ctrl: false, .. }
-            if matches!(self.mode, Mode::Operator(_))
+            if matches!(self.mode, Mode::Operator(_) | Mode::Visual)
               && matches!(self.pending, Input { key: Key::Char('i'), ctrl: false, .. }) =>
           {
-            select_inner_word(textarea); // `iw` text object, e.g. `ciw`, `diw`, `yiw`
+            select_inner_word(textarea, self.mode == Mode::Visual); // `iw`: `ciw`/`diw`/`yiw`/`viw`
+          },
+          Input { key: Key::Char('W'), ctrl: false, .. }
+            if matches!(self.mode, Mode::Operator(_) | Mode::Visual)
+              && matches!(self.pending, Input { key: Key::Char('i'), ctrl: false, .. }) =>
+          {
+            select_inner_big_word(textarea, self.mode == Mode::Visual); // `iW`: `ciW`/`diW`/`yiW`/`viW`
+          },
+          Input { key: Key::Char('"'), .. }
+            if matches!(self.mode, Mode::Operator(_) | Mode::Visual)
+              && matches!(self.pending, Input { key: Key::Char('i'), ctrl: false, .. }) =>
+          {
+            select_inner_quoted(textarea, '"', self.mode == Mode::Visual); // `i"`: `ci"`/`di"`/`yi"`/`vi"`
           },
           Input { key: Key::Char('w'), .. } => textarea.move_cursor(CursorMove::WordForward),
           Input { key: Key::Char('W'), ctrl: false, .. } => move_cursor_big_word_forward(textarea),
@@ -192,6 +204,9 @@ impl Vim {
           Input { key: Key::Char('r'), ctrl: false, .. } => {
             return Transition::Mode(Mode::Replace);
           },
+          Input { key: Key::Char('x'), ctrl: true, .. } if self.mode == Mode::Normal => {
+            increment_number_under_cursor(textarea, -1);
+          },
           Input { key: Key::Char('x'), .. } => {
             if !textarea.is_selecting() {
               textarea.start_selection();
@@ -223,9 +238,9 @@ impl Vim {
             return Transition::Mode(Mode::Normal);
           },
           Input { key: Key::Char('i'), ctrl: false, .. }
-            if matches!(self.mode, Mode::Operator(_)) =>
+            if matches!(self.mode, Mode::Operator(_) | Mode::Visual) =>
           {
-            // Wait for the text object that follows, e.g. `w` in `ciw`/`diw`/`yiw`.
+            // Wait for the text object that follows, e.g. `w` in `ciw`/`diw`/`yiw`/`viw`.
             return Transition::Pending(input);
           },
           Input { key: Key::Char('i'), .. } => {
@@ -241,6 +256,9 @@ impl Vim {
             textarea.move_cursor(CursorMove::WordBack);
             textarea.start_selection();
             return Transition::Nop;
+          },
+          Input { key: Key::Char('a'), ctrl: true, .. } if self.mode == Mode::Normal => {
+            increment_number_under_cursor(textarea, 1);
           },
           Input { key: Key::Char('a'), .. } => {
             textarea.cancel_selection();
@@ -447,9 +465,58 @@ impl InnerWordKind {
   }
 }
 
+// Find the span (start, end) of the first decimal number on the line whose end touches or
+// follows `start_col` (vim only searches forward on the current line, never wraps or looks
+// backward), including an immediately-preceding minus sign.
+fn find_number_span(chars: &[char], start_col: usize) -> Option<(usize, usize)> {
+  let n = chars.len();
+  let mut i = 0;
+  while i < n {
+    if chars[i].is_ascii_digit() {
+      let digit_start = i;
+      while i < n && chars[i].is_ascii_digit() {
+        i += 1;
+      }
+      let start = if digit_start > 0 && chars[digit_start - 1] == '-' { digit_start - 1 } else { digit_start };
+      if i > start_col {
+        return Some((start, i));
+      }
+    } else {
+      i += 1;
+    }
+  }
+  None
+}
+
+// `Ctrl-A` / `Ctrl-X`: increment or decrement the next number on the line by `delta`, preserving
+// zero-padded width (e.g. `007` -> `008`) the way Vim does.
+fn increment_number_under_cursor(textarea: &mut TextArea, delta: i64) {
+  let cursor = textarea.cursor();
+  let chars: Vec<char> = textarea.lines()[cursor.0].chars().collect();
+  let Some((start, end)) = find_number_span(&chars, cursor.1) else {
+    return;
+  };
+  let text: String = chars[start..end].iter().collect();
+  let Ok(value) = text.parse::<i64>() else {
+    return;
+  };
+  let new_value = value.saturating_add(delta);
+  let digit_start = if chars[start] == '-' { start + 1 } else { start };
+  let width = end - digit_start;
+  let has_leading_zero = width > 1 && chars[digit_start] == '0';
+  let new_text =
+    if has_leading_zero && new_value >= 0 { format!("{new_value:0width$}") } else { new_value.to_string() };
+  let row = cursor.0;
+  textarea.cancel_selection();
+  textarea.move_cursor(CursorMove::Jump(row as u16, start as u16));
+  textarea.delete_str(end - start);
+  textarea.insert_str(&new_text);
+  textarea.move_cursor(CursorMove::Back);
+}
+
 // Select the `iw` text object under the cursor: the run of same-kind characters (word,
 // punctuation, or whitespace) touching the cursor, not crossing line boundaries.
-fn select_inner_word(textarea: &mut TextArea) {
+fn select_inner_word(textarea: &mut TextArea, visual: bool) {
   let cursor = textarea.cursor();
   let chars: Vec<char> = textarea.lines()[cursor.0].chars().collect();
   if chars.is_empty() {
@@ -466,10 +533,64 @@ fn select_inner_word(textarea: &mut TextArea) {
     end += 1;
   }
   let row = cursor.0;
+  // Operator-pending mode wants an exclusive end (`end + 1`); Visual mode's y/d/c/x handlers
+  // already nudge the cursor forward by one to account for inclusive selection, so land one
+  // character earlier here to avoid double-counting.
+  let target = if visual { end } else { end + 1 };
   textarea.cancel_selection();
   textarea.move_cursor(CursorMove::Jump(row as u16, start as u16));
   textarea.start_selection();
-  textarea.move_cursor(CursorMove::Jump(row as u16, (end + 1) as u16));
+  textarea.move_cursor(CursorMove::Jump(row as u16, target as u16));
+}
+
+// Select the `iW` text object under the cursor: the run of whitespace or non-whitespace
+// characters touching the cursor, not crossing line boundaries.
+fn select_inner_big_word(textarea: &mut TextArea, visual: bool) {
+  let cursor = textarea.cursor();
+  let chars: Vec<char> = textarea.lines()[cursor.0].chars().collect();
+  if chars.is_empty() {
+    return;
+  }
+  let col = cursor.1.min(chars.len() - 1);
+  let is_space = chars[col].is_whitespace();
+  let mut start = col;
+  while start > 0 && chars[start - 1].is_whitespace() == is_space {
+    start -= 1;
+  }
+  let mut end = col;
+  while end + 1 < chars.len() && chars[end + 1].is_whitespace() == is_space {
+    end += 1;
+  }
+  let row = cursor.0;
+  let target = if visual { end } else { end + 1 };
+  textarea.cancel_selection();
+  textarea.move_cursor(CursorMove::Jump(row as u16, start as u16));
+  textarea.start_selection();
+  textarea.move_cursor(CursorMove::Jump(row as u16, target as u16));
+}
+
+// Select the `i"` (or other quote char) text object: the text strictly between the nearest
+// pair of quote characters on the current line, at or after the cursor. Does not cross lines
+// and does not handle escaped quotes.
+fn select_inner_quoted(textarea: &mut TextArea, quote: char, visual: bool) {
+  let cursor = textarea.cursor();
+  let chars: Vec<char> = textarea.lines()[cursor.0].chars().collect();
+  let positions: Vec<usize> =
+    chars.iter().enumerate().filter(|(_, c)| **c == quote).map(|(i, _)| i).collect();
+  let col = cursor.1;
+  let Some(pair) = positions.chunks_exact(2).find(|p| p[1] >= col) else {
+    return;
+  };
+  let (start, end) = (pair[0], pair[1]);
+  if end <= start + 1 {
+    return; // empty quotes, nothing between them
+  }
+  let row = cursor.0;
+  let target = if visual { end - 1 } else { end };
+  textarea.cancel_selection();
+  textarea.move_cursor(CursorMove::Jump(row as u16, (start + 1) as u16));
+  textarea.start_selection();
+  textarea.move_cursor(CursorMove::Jump(row as u16, target as u16));
 }
 
 // Unlike a (small) word, a WORD is only delimited by whitespace, e.g. `foo(a).bar` is one WORD.
