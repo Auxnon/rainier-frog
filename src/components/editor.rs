@@ -217,7 +217,7 @@ impl Editor<'_> {
       Input { key: Key::Esc, .. } => {
         self.completion.dismiss();
         self.cancel_completion();
-        true
+        false
       },
       Input { key: Key::Up, .. } | Input { key: Key::Char('p'), ctrl: true, .. } => {
         self.completion.previous();
