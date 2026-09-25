@@ -252,6 +252,10 @@ fn duck_value_to_string(value: &DuckValue) -> String {
     DuckValue::Struct(map) => format_struct(map),
     DuckValue::Map(map) => format_map(map),
     DuckValue::Union(inner) => duck_value_to_string(inner.as_ref()),
+    // `duckdb::types::Value` is `#[non_exhaustive]`, so a wildcard is required even
+    // though every current variant is handled above; render anything new via Debug.
+    #[allow(unreachable_patterns)]
+    other => format!("{other:?}"),
   }
 }
 
